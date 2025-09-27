@@ -1,6 +1,6 @@
 // src/screens/convoy/ConvoyMapScreen.tsx
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { View, Text, Pressable, Alert, FlatList, Platform } from 'react-native';
+import { View, Text, Pressable, Alert, FlatList } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import MapViewDirections from 'react-native-maps-directions';
 import * as Location from 'expo-location';
@@ -11,6 +11,7 @@ import { subscribePositions, subscribeConvoyMeta } from '../../features/convoy/r
 import { startPublishing, stopPublishing } from '../../features/convoy/publisher';
 import type { PositionRow, UUID, Member } from '../../features/convoy/types';
 import { projectPointToPolyline, haversineMeters } from '../../utils/geo';
+import { SmoothLocationTracker } from '../../utils/smoothNavigation'; // ⬅️ NEW
 import PlacesSearch from '../../components/PlacesSearch';
 
 const GOOGLE_KEY = (Constants.expoConfig?.extra as any)?.googleMapsKey as string;
@@ -90,6 +91,9 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
   const [displayPos, setDisplayPos] = useState<{ latitude: number; longitude: number } | null>(null);
   const [isGuiding, setIsGuiding] = useState(false);
 
+  // ⬅️ NEW: smooth tracker ref
+  const smoothTracker = useRef<SmoothLocationTracker | null>(null);
+
   // Hide/show bottom tabs in guidance
   useEffect(() => {
     const parent = navigation.getParent?.();
@@ -108,7 +112,7 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
       if (destination_lat && destination_lng) {
         const d = { lat: destination_lat, lng: destination_lng };
         setDest(d);
-        setIsGuiding(true);   // enter guidance when a dest arrives
+        setIsGuiding(true);
       } else {
         setDest(null);
         setRouteCoords([]); setSteps([]); setEta(null); setStepIndex(0);
@@ -145,52 +149,77 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
 
   const isCreator = useMemo(() => creatorId && deviceId === creatorId, [creatorId, deviceId]);
 
-  // Follow + bearing logic (Apple Maps feel)
+  // 🔁 REPLACED: location tracking effect with smooth tracker + snapping + step progression
   useEffect(() => {
     let sub: Location.LocationSubscription | null = null;
+
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') return;
+
+      // create (or recreate) the smoother
+      smoothTracker.current = new SmoothLocationTracker((smoothPos, heading) => {
+        // Snap to route if we have one
+        const center = (dest && routeCoords.length > 1)
+          ? projectPointToPolyline(smoothPos, routeCoords).snapped
+          : smoothPos;
+
+        setDisplayPos(center);
+
+        if (follow && mapRef.current) {
+          // fallback heading along the route if GPS heading is empty/zero
+          let finalHeading = heading;
+          if ((!heading || heading === 0) && routeCoords.length > 1) {
+            const idx = closestIndexOnRoute(routeCoords, center);
+            const ahead = routeCoords[Math.min(idx + 1, routeCoords.length - 1)];
+            finalHeading = bearingBetween(center, ahead);
+          }
+
+          mapRef.current.animateCamera(
+            {
+              center,
+              zoom: isGuiding ? 18 : 16,
+              pitch: isGuiding ? 60 : 40,
+              heading: finalHeading,
+            },
+            { duration: 300 }
+          );
+        }
+      });
+
+      // High-frequency GPS updates into the smoother
       sub = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.Balanced, timeInterval: 1200, distanceInterval: 5 },
+        {
+          accuracy: Location.Accuracy.BestForNavigation,
+          timeInterval: 500,
+          distanceInterval: 1,
+        },
         (loc) => {
+          // feed the smoother
+          smoothTracker.current?.updatePosition(loc);
+
+          // step progression uses snapped center (route-aware)
           const raw = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
           const center = (dest && routeCoords.length > 1)
             ? projectPointToPolyline(raw, routeCoords).snapped
             : raw;
-          setDisplayPos(center);
 
-          if (follow && mapRef.current) {
-            let heading = Number.isFinite(loc.coords.heading) ? (loc.coords.heading as number) : 0;
-
-            // If heading not available (common at standstill), fall back to bearing along the route ahead
-            if ((!heading || heading === 0) && routeCoords.length > 1) {
-              const idx = closestIndexOnRoute(routeCoords, center);
-              const ahead = routeCoords[Math.min(idx + 1, routeCoords.length - 1)];
-              heading = bearingBetween(center, ahead);
-            }
-
-            mapRef.current.animateCamera(
-              {
-                center,
-                zoom: isGuiding ? 18 : 16,
-                pitch: isGuiding ? 60 : 40,
-                heading,
-              },
-              { duration: 500 }
-            );
-          }
-
-          // step progression
           if (steps[stepIndex]) {
             const nextEnd = steps[stepIndex].end;
             const dist = haversineMeters(center, { latitude: nextEnd.lat, longitude: nextEnd.lng });
-            if (dist < 50 && stepIndex < steps.length - 1) setStepIndex(stepIndex + 1);
+            if (dist < 50 && stepIndex < steps.length - 1) {
+              setStepIndex(stepIndex + 1);
+            }
           }
         }
       );
     })();
-    return () => { try { sub?.remove(); } catch {} };
+
+    return () => {
+      smoothTracker.current?.stop();
+      smoothTracker.current = null;
+      try { sub?.remove(); } catch {}
+    };
   }, [follow, dest, routeCoords.length, steps, stepIndex, isGuiding]);
 
   const toggleSharing = async () => {
@@ -262,9 +291,7 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
     }
   }, [me?.lat, me?.lng]);
 
-  const membersCount = members.length || positions.length || 1;
   const next = steps[stepIndex];
-  const arrow = next?.maneuver ? (MANEUVER_ICON[next.maneuver] || '⬆️') : '⬆️';
 
   // End guidance
   const endGuidance = async () => {
@@ -276,7 +303,7 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
     if (isCreator) { try { await setDestination(convoyId, null as any, null as any); } catch {} }
   };
 
-  // After MapViewDirections gives us coordinates, snap + orient camera once at start of guidance
+  // Oriented kick at start of guidance
   const orientAtStart = () => {
     if (!mapRef.current || !displayPos || routeCoords.length < 2) return;
     const idx = closestIndexOnRoute(routeCoords, displayPos);
@@ -342,7 +369,6 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
               setRouteCoords(coords);
               if (!eta) setEta({ km: res.distance, min: res.duration });
 
-              // Fit once if not following; otherwise we’ll do an oriented zoom
               if (mapRef.current && (!follow || !isGuiding)) {
                 mapRef.current.fitToCoordinates(coords, {
                   edgePadding: { top: 100, bottom: 200, left: 40, right: 40 },
@@ -350,18 +376,14 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
                 });
               }
 
-              // If entering guidance, do the oriented camera kick
-              if (isGuiding) {
-                // small delay to ensure map applied the polyline
-                setTimeout(orientAtStart, 250);
-              }
+              if (isGuiding) setTimeout(orientAtStart, 250);
             }}
             onError={(e) => console.warn('Directions error', e)}
           />
         )}
       </MapView>
 
-      {/* ======= TOP STACK (no overlap) ======= */}
+      {/* ======= TOP STACK ======= */}
       {!isGuiding && (
         <View style={{ position: 'absolute', top: 16, left: 12, right: 12 }}>
           {/* Creator search row */}
@@ -372,9 +394,9 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
                 onPlaceSelected={async ({ lat, lng }) => {
                   try {
                     await setDestination(convoyId, lat, lng);
-                    setDest({ lat, lng }); // optimistic
+                    setDest({ lat, lng });
                     setFollow(true);
-                    setIsGuiding(true); // go full-screen
+                    setIsGuiding(true);
                   } catch (e: any) {
                     Alert.alert('Error', e.message || 'Unable to set destination');
                   }
@@ -391,7 +413,7 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
             </>
           )}
 
-          {/* Convoy bar – always sits BELOW the search area */}
+          {/* Convoy bar */}
           <Pressable
             onPress={() => setShowMembers((s) => !s)}
             style={{
@@ -413,7 +435,7 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
         </View>
       )}
 
-      {/* Members sheet (not in guidance) */}
+      {/* Members sheet */}
       {!isGuiding && showMembers && (
         <View style={{
           position: 'absolute', left: 0, right: 0, bottom: 0,
@@ -442,7 +464,7 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
         </View>
       )}
 
-      {/* Guidance banner (arrow + next instruction + distance + ETA) */}
+      {/* Guidance banner */}
       {isGuiding && dest && steps[stepIndex] && (
         <View style={{ position: 'absolute', top: 16, left: 12, right: 12 }}>
           <View style={{ backgroundColor: '#0b1020', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: '#1f2937' }}>
@@ -480,7 +502,7 @@ export default function ConvoyMapScreen({ route, navigation }: Props) {
         </View>
       )}
 
-      {/* End Guidance (bottom-left) */}
+      {/* End Guidance */}
       {isGuiding && (
         <Pressable
           onPress={endGuidance}
