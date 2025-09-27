@@ -9,6 +9,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import PlacesSearch from '../components/PlacesSearch';
 import BottomSheet from '../components/BottomSheet';
+import { SmoothLocationTracker, SMOOTH_NAV_CONFIG, getCameraSettings } from '../utils/smoothNavigation';
 import { distanceToPolylineMeters, haversineMeters, LatLng as LL } from '../utils/geo';
 
 const GOOGLE_KEY = (Constants.expoConfig?.extra as any)?.googleMapsKey as string;
@@ -27,6 +28,8 @@ const darkMapStyle = [
   { featureType: 'poi.park', elementType: 'geometry', stylers: [{ color: '#0b1020' }] },
   { featureType: 'poi.park', elementType: 'labels.text.fill', stylers: [{ color: '#94a3b8' }] },
   { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#334155' }] },
+  { elementType: 'road', featureType: 'road', stylers: [{ color: '#334155' }] },
+  { elementType: 'road', stylers: [{ color: '#334155' }] },
   { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#0b1020' }] },
   { featureType: 'road', elementType: 'labels.text.fill', stylers: [{ color: '#cbd5e1' }] },
   { featureType: 'transit', elementType: 'geometry', stylers: [{ color: '#0b1020' }] },
@@ -51,6 +54,10 @@ export default function DirectionsScreen() {
   const [lastSpoken, setLastSpoken] = useState<number>(-1);
   const [followUser, setFollowUser] = useState(true);
   const [showSteps, setShowSteps] = useState(false);
+
+  // --- Smooth tracker + speed refs ---
+  const smoothTracker = useRef<SmoothLocationTracker | null>(null);
+  const lastSpeedRef = useRef<number>(0);
 
   const stripHtml = (s: string) => s.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ');
 
@@ -118,6 +125,7 @@ export default function DirectionsScreen() {
     setLastSpoken(index);
   };
 
+  // --- START GUIDANCE (smooth tracker version) ---
   const startGuidance = async () => {
     if (!origin || !destination || steps.length === 0) return;
     setGuiding(true);
@@ -126,20 +134,38 @@ export default function DirectionsScreen() {
     setFollowUser(true);
     Speech.speak(`Starting guidance. ${steps[0].instruction}`);
 
+    // Initialize smooth tracker for camera motion
+    smoothTracker.current = new SmoothLocationTracker((position, heading) => {
+      if (followUser && mapRef.current) {
+        const speedKmh = lastSpeedRef.current * 3.6;
+        const { zoom, pitch } = getCameraSettings(speedKmh);
+
+        mapRef.current.animateCamera(
+          {
+            center: position,
+            heading,
+            pitch,
+            zoom,
+          },
+          { duration: SMOOTH_NAV_CONFIG.CAMERA.animationDuration }
+        );
+      }
+    });
+
+    // High-frequency GPS updates
     locSub.current = await Location.watchPositionAsync(
-      { accuracy: Location.Accuracy.Balanced, timeInterval: 1000, distanceInterval: 3 },
+      SMOOTH_NAV_CONFIG.GPS,
       (loc) => {
         const speed = loc.coords.speed ?? 0;
-        const heading = Number.isFinite(loc.coords.heading) ? loc.coords.heading : 0;
         const curr: LL = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
 
-        if (followUser && mapRef.current) {
-          mapRef.current.animateCamera(
-            { center: curr, heading, pitch: 45, zoom: 16.5 },
-            { duration: 600 }
-          );
-        }
+        // Store speed for camera settings
+        lastSpeedRef.current = speed;
 
+        // Feed the smoother
+        smoothTracker.current?.updatePosition(loc);
+
+        // Off-route detection
         if (routeCoords.length > 1) {
           const off = distanceToPolylineMeters(curr, routeCoords);
           if (off > 80) {
@@ -148,13 +174,23 @@ export default function DirectionsScreen() {
           }
         }
 
+        // Turn-by-turn
         const next = steps[stepIndex];
         if (!next) { Speech.speak('You have arrived.'); stopGuidance(); return; }
 
         const distToNext = haversineMeters(curr, { latitude: next.end.lat, longitude: next.end.lng });
-        const preAnnounce = speed >= 22 ? 400 : 150;
 
-        if (distToNext < preAnnounce && stepIndex !== lastSpoken) speakOnce(stepIndex, next.instruction);
+        // Dynamic pre-announce distance based on speed (m/s thresholds)
+        const preAnnounce =
+          speed >= 25 ? 500 :  // ~90 km/h
+          speed >= 15 ? 300 :  // ~54 km/h
+          speed >= 8  ? 200 :  // ~29 km/h
+                        100;   // very slow
+
+        if (distToNext < preAnnounce && stepIndex !== lastSpoken) {
+          speakOnce(stepIndex, next.instruction);
+        }
+
         if (distToNext < 50) {
           const newIndex = stepIndex + 1;
           setStepIndex(newIndex);
@@ -166,14 +202,48 @@ export default function DirectionsScreen() {
     );
   };
 
+  // --- STOP GUIDANCE (cleanup smooth tracker too) ---
   const stopGuidance = () => {
     setGuiding(false);
+    smoothTracker.current?.stop();
+    smoothTracker.current = null;
     try { locSub.current?.remove(); } catch {}
     locSub.current = null;
     Speech.stop();
   };
 
   useEffect(() => () => stopGuidance(), []);
+
+  // --- Follow mode when NOT guiding: smooth camera on user ---
+  useEffect(() => {
+    if (guiding) return; // handled in startGuidance
+
+    let sub: Location.LocationSubscription | null = null;
+    let tracker: SmoothLocationTracker | null = null;
+
+    (async () => {
+      if (!followUser) return;
+
+      tracker = new SmoothLocationTracker((position, heading) => {
+        if (followUser && mapRef.current) {
+          mapRef.current.animateCamera(
+            { center: position, heading, pitch: 45, zoom: 16.5 },
+            { duration: 300 }
+          );
+        }
+      });
+
+      sub = await Location.watchPositionAsync(
+        SMOOTH_NAV_CONFIG.GPS,
+        (loc) => tracker?.updatePosition(loc)
+      );
+    })();
+
+    return () => {
+      tracker?.stop();
+      try { sub?.remove(); } catch {}
+    };
+  }, [followUser, guiding]);
 
   const region: Region = destination
     ? { latitude: destination.lat, longitude: destination.lng, latitudeDelta: 0.04, longitudeDelta: 0.04 }

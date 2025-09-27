@@ -1,7 +1,8 @@
+// src/features/convoy/publisher.ts
 import * as Location from 'expo-location';
 import { upsertPosition } from './api';
-import type { UUID } from './types';
 import { haversineMeters } from '../../utils/geo';
+import type { UUID } from './types';
 
 let sub: Location.LocationSubscription | null = null;
 let lastSent = 0;
@@ -12,14 +13,21 @@ export async function startPublishing(convoyId: UUID, userId: string) {
   if (status !== 'granted') throw new Error('Location permission required');
 
   sub = await Location.watchPositionAsync(
-    { accuracy: Location.Accuracy.Balanced, timeInterval: 1500, distanceInterval: 5 },
+    {
+      accuracy: Location.Accuracy.BestForNavigation, // ⬅️ higher accuracy
+      timeInterval: 1000,                             // ⬅️ 1s cadence
+      distanceInterval: 2,                            // ⬅️ small movements matter
+    },
     async (loc) => {
       const now = Date.now();
       const p = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
       const moved = lastPos ? haversineMeters(lastPos, p) : Infinity;
 
-      if (now - lastSent < 1500 && moved < 8) return; // throttle
-      lastSent = now; lastPos = p;
+      // Throttle network, but allow small moves each second
+      if (now - lastSent < 1000 && moved < 3) return;
+
+      lastSent = now;
+      lastPos = p;
 
       await upsertPosition({
         convoy_id: convoyId,
@@ -27,7 +35,7 @@ export async function startPublishing(convoyId: UUID, userId: string) {
         lat: p.latitude,
         lng: p.longitude,
         speed_mps: loc.coords.speed ?? null,
-        heading_deg: Number.isFinite(loc.coords.heading) ? loc.coords.heading : null,
+        heading_deg: Number.isFinite(loc.coords.heading) ? (loc.coords.heading as number) : null,
         updated_at: new Date().toISOString(),
       });
     }
