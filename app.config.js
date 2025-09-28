@@ -5,13 +5,16 @@ export default ({ config }) => ({
   ...config,
   name: 'Tracklink',
   slug: 'tracklink',
+
   splash: {
     image: './assets/splash.png',
     resizeMode: 'contain',
     backgroundColor: '#0B1020',
   },
+
   ios: {
     ...config.ios,
+    bundleIdentifier: 'com.memo.tracklink',           // <= add this
     infoPlist: {
       ...(config.ios?.infoPlist || {}),
       NSLocationWhenInUseUsageDescription:
@@ -22,8 +25,10 @@ export default ({ config }) => ({
       LSApplicationQueriesSchemes: ['comgooglemaps', 'waze'],
     },
   },
+
   android: {
     ...config.android,
+    package: 'com.memo.tracklink',                    // <= add this
     permissions: [
       'ACCESS_FINE_LOCATION',
       'ACCESS_COARSE_LOCATION',
@@ -31,6 +36,7 @@ export default ({ config }) => ({
       'FOREGROUND_SERVICE',
     ],
   },
+
   extra: {
     ...config.extra,
     googleMapsKey: process.env.EXPO_PUBLIC_GOOGLE_MAPS_KEY,

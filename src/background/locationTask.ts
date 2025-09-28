@@ -1,24 +1,18 @@
 import * as TaskManager from 'expo-task-manager';
-import * as Location from 'expo-location';
-import { useRecording } from '../state/useRecording';
+// import * as Location from 'expo-location'; // only if you want to debug payloads
 
-export const TASK_NAME = 'tracklink.location';
+// Must MATCH what RecordScreen imports
+export const TASK_NAME = 'tracklink-location';
 
-// Define once per app process (Expo Fast Refresh re-runs modules; this is fine)
+// Define once per app process
 TaskManager.defineTask(TASK_NAME, ({ data, error }) => {
   if (error) {
-    console.error('Location task error:', error);
+    console.warn('Location task error:', error);
     return;
   }
-  const payload = data as { locations?: Location.LocationObject[] } | undefined;
-  const loc = payload?.locations?.[0];
-  if (!loc) return;
-
-  const { latitude, longitude } = loc.coords;
-  // Push into the in-memory recording buffer
-  useRecording.getState().add({
-    lat: latitude,
-    lng: longitude,
-    ts: Date.now(),
-  });
+  // We intentionally do NOT mutate app state here to avoid double-logging and stuck sessions.
+  // Foreground watchPositionAsync handles recording points.
+  // If you need to debug, uncomment below:
+  // const { locations } = (data ?? {}) as { locations?: Location.LocationObject[] };
+  // console.log('BG tick', locations?.[0]?.coords);
 });

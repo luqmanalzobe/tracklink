@@ -12,11 +12,14 @@ type RecState = {
   reset: () => void;
 };
 
-export const useRecording = create<RecState>((set) => ({
+export const useRecording = create<RecState>((set, get) => ({
   recording: false,
   startTime: null,
   points: [],
-  start: () => set({ recording: true, startTime: Date.now(), points: [] }),
+  start: () => {
+    if (get().recording) return; // guard double-starts
+    set({ recording: true, startTime: Date.now(), points: [] });
+  },
   stop: () => set({ recording: false }),
   add: (p) => set((s) => ({ points: [...s.points, p] })),
   reset: () => set({ recording: false, startTime: null, points: [] }),

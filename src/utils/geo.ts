@@ -63,7 +63,6 @@ export function distanceToPolylineMeters(p: LatLng, poly: LatLng[]): number {
   return best;
 }
 
-// NEW: project a point to the closest place on the polyline
 export function projectPointToPolyline(
   p: LatLng,
   poly: LatLng[]
@@ -77,4 +76,53 @@ export function projectPointToPolyline(
     }
   }
   return best;
+}
+
+/* -----------------------------
+   Forward-offset helpers
+------------------------------*/
+
+/** Move a lat/lng by `meters` along a `bearingDeg` direction. */
+export function offsetByMeters(
+  coord: LatLng,
+  meters: number,
+  bearingDeg: number
+): LatLng {
+  const brng = (bearingDeg * Math.PI) / 180;
+  const lat1 = (coord.latitude * Math.PI) / 180;
+  const lon1 = (coord.longitude * Math.PI) / 180;
+  const dr = meters / R;
+
+  const sinLat1 = Math.sin(lat1);
+  const cosLat1 = Math.cos(lat1);
+
+  const lat2 = Math.asin(
+    sinLat1 * Math.cos(dr) + cosLat1 * Math.sin(dr) * Math.cos(brng)
+  );
+  const lon2 =
+    lon1 +
+    Math.atan2(
+      Math.sin(brng) * Math.sin(dr) * cosLat1,
+      Math.cos(dr) - sinLat1 * Math.sin(lat2)
+    );
+
+  return {
+    latitude: (lat2 * 180) / Math.PI,
+    longitude: (lon2 * 180) / Math.PI,
+  };
+}
+
+/**
+ * Speed/zoom-aware forward bias in meters.
+ * - More bias as speed increases
+ * - Slightly reduced bias at lower zooms (wider view)
+ */
+export function forwardBiasMeters(speedKmh: number, zoom: number): number {
+  const BIAS_MIN = 40;    // low-speed baseline
+  const BIAS_MAX = 220;   // cap for highway speeds
+  const multiplier = 2.0; // meters per km/h
+
+  const base = Math.max(BIAS_MIN, Math.min(BIAS_MAX, BIAS_MIN + speedKmh * multiplier));
+  const zoomFactor = Math.max(0.6, Math.min(1.0, (zoom - 14) / 5)); // z=14 -> 0.6, z>=19 -> 1.0
+  return base * zoomFactor;
 }

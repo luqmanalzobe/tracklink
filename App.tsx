@@ -7,29 +7,29 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 
-
-// Screens
 import WarningScreen from './src/screens/WarningScreen';
 import WelcomeScreen from './src/screens/WelcomeScreen';
 import RecordScreen from './src/screens/RecordScreen';
 import DrivesScreen from './src/screens/DrivesScreen';
 import DriveDetailScreen from './src/screens/DriveDetailScreen';
 import ConvoyScreen from './src/screens/ConvoyScreen';
-import LeaderboardsScreen from './src/screens/LeaderboardsScreen';
-import FeedScreen from './src/screens/FeedScreen';
 import GarageScreen from './src/screens/GarageScreen';
 import DirectionsScreen from './src/screens/DirectionsScreen';
 import ConvoyNavigator from './src/navigation/ConvoyNavigator';
 
-
-// State
 import { useDrives } from './src/state/useDrives';
-
-// Register background location task
 import './src/background/locationTask';
 
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
+
+// ✅ Export this so other screens can import it (DriveDetailScreen does)
+export type RootStackParamList = {
+  Warning: undefined;
+  Welcome: undefined;
+  Tabs: undefined;
+  DriveDetail: { id: string };
+};
 
 function withSafeArea(Component: React.ComponentType<any>) {
   return (props: any) => (
@@ -54,17 +54,17 @@ function Tabs() {
             case 'Record':
               iconName = focused ? 'radio-button-on' : 'radio-button-off';
               break;
-            case 'Convoy':
-              iconName = focused ? 'navigate' : 'navigate-outline';
+            case 'Drives':
+              iconName = focused ? 'time' : 'time-outline';
               break;
-            case 'Leaderboards':
-              iconName = focused ? 'trophy' : 'trophy-outline';
-              break;
-            case 'Feed':
-              iconName = focused ? 'list' : 'list-outline';
+            case 'Directions':
+              iconName = focused ? 'map' : 'map-outline';
               break;
             case 'Garage':
               iconName = focused ? 'person' : 'person-outline';
+              break;
+            case 'Convoy':
+              iconName = focused ? 'navigate' : 'navigate-outline';
               break;
             default:
               iconName = 'ellipse';
@@ -74,24 +74,18 @@ function Tabs() {
       })}
     >
       <Tab.Screen name="Record" component={withSafeArea(RecordScreen)} />
+      <Tab.Screen name="Drives" component={withSafeArea(DrivesScreen)} />
       <Tab.Screen name="Directions" component={withSafeArea(DirectionsScreen)} />
-      <Tab.Screen name="Leaderboards" component={withSafeArea(LeaderboardsScreen)} />
-      <Tab.Screen name="Feed" component={withSafeArea(FeedScreen)} />
       <Tab.Screen name="Garage" component={withSafeArea(GarageScreen)} />
-       <Tab.Screen
-    name="Convoy"
-    component={ConvoyNavigator}
-    options={{ title: 'Convoy' }}
-  />
+      <Tab.Screen name="Convoy" component={ConvoyNavigator} options={{ title: 'Convoy' }} />
     </Tab.Navigator>
   );
 }
 
+
 export default function App() {
   const hydrate = useDrives((s) => s._hydrate);
-  useEffect(() => {
-    hydrate();
-  }, [hydrate]);
+  useEffect(() => { hydrate(); }, [hydrate]);
 
   return (
     <SafeAreaProvider>
