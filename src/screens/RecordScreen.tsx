@@ -1,13 +1,16 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { View, Alert, Text, Modal, Pressable, TextInput } from 'react-native';
-import MapView, { Polyline, Marker, Region } from 'react-native-maps';
+import MapView, { Polyline, Marker, Circle } from 'react-native-maps';
 import * as Location from 'expo-location';
+import * as Haptics from 'expo-haptics';
 import { useRecording } from '../state/useRecording';
 import { useDrives } from '../state/useDrives';
 import { distanceKm, durationSec, avgKmh } from '../lib/stats';
 import { TASK_NAME } from '../background/locationTask';
 import { SmoothLocationTracker, SMOOTH_NAV_CONFIG, getCameraSettings } from '../utils/smoothNavigation';
-import { offsetByMeters, forwardBiasMeters } from '../utils/geo';
+import { offsetByMeters, forwardBiasMeters, haversineMeters } from '../utils/geo';
+import type { SavedDrive } from '../state/useDrives';
+import { RouteIntroOverlay } from '../components/RouteIntroOverlay';
 
 const darkMapStyle = [
   { elementType: 'geometry', stylers: [{ color: '#1f2937' }] },
@@ -19,30 +22,97 @@ const darkMapStyle = [
   { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#0b1320' }] },
 ];
 
-export default function RecordScreen() {
+const START_RADIUS = 15;
+const END_RADIUS = 15;
+
+// ---- Camera follow tuning ----
+const CAMERA_THROTTLE_MS = 350;
+const MOVE_THRESHOLD_M = 6;
+const HEAD_TURN_THRESHOLD = 8;
+
+type Props = { route: any; navigation: any };
+type LatLng = { latitude: number; longitude: number };
+
+function degDiff(a?: number | null, b?: number | null) {
+  if (a == null || b == null) return 999;
+  let d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+export default function RecordScreen({ route: navRoute, navigation }: Props) {
   const { recording, startTime, points, start, stop, add, reset } = useRecording();
   const { addDrive } = useDrives();
 
+  // Route replay
+  const routeToRun = navRoute?.params?.routeToRun as SavedDrive | undefined;
+  const isRouteMode = !!routeToRun;
+
+  // Route state
+  const [routeModeActive, setRouteModeActive] = useState(false);
+  const [routeStarted, setRouteStarted] = useState(false);
+  const [routeEnded, setRouteEnded] = useState(false);
+  const [nearStart, setNearStart] = useState(false);
+  const [nearEnd, setNearEnd] = useState(false);
+
+  // Intro overlay
+  const [showRouteIntro, setShowRouteIntro] = useState(false);
+  const introPlayedRef = useRef(false);
+
   const mapRef = useRef<MapView | null>(null);
   const smoothTracker = useRef<SmoothLocationTracker | null>(null);
+
   const lastSpeedRef = useRef<number>(0);
   const lastHeadingRef = useRef<number>(0);
-  const followUserRef = useRef<boolean>(true);
-  const lastAnimRef = useRef<number>(0);
 
-  const [region, setRegion] = useState<Region>({
-    latitude: 43.653, longitude: -79.383, latitudeDelta: 0.05, longitudeDelta: 0.05,
-  });
+  // Follow state
   const [followUser, setFollowUser] = useState(true);
-  const [currentPosition, setCurrentPosition] = useState<{ latitude: number; longitude: number } | null>(null);
+  const followUserRef = useRef<boolean>(true);
+  useEffect(() => { followUserRef.current = followUser; }, [followUser]);
 
-  // Summary modal state + NEW title/description fields
+  // throttle & gating refs
+  const lastAnimRef = useRef<number>(0);
+  const lastCamPosRef = useRef<LatLng | null>(null);
+  const lastCamHeadingRef = useRef<number | null>(null);
+
+  // SINGLE watcher + stable recording flag
+  const watchRef = useRef<Location.LocationSubscription | null>(null);
+  const recordingRef = useRef<boolean>(recording);
+  useEffect(() => { recordingRef.current = recording; }, [recording]);
+
+  const [currentPosition, setCurrentPosition] = useState<LatLng | null>(null);
+
+  // Summary modal
   const [showSummary, setShowSummary] = useState(false);
   const [sumDistanceKm, setSumDistanceKm] = useState(0);
   const [sumDurationSec, setSumDurationSec] = useState(0);
   const [sumAvgKmh, setSumAvgKmh] = useState(0);
   const [driveTitle, setDriveTitle] = useState('');
   const [driveDesc, setDriveDesc] = useState('');
+  const [originalTime, setOriginalTime] = useState<number | null>(null);
+
+  const routeStart = useMemo(
+    () => routeToRun ? { lat: routeToRun.points[0].lat, lng: routeToRun.points[0].lng } : null,
+    [routeToRun]
+  );
+  const routeEnd = useMemo(
+    () => routeToRun ? { lat: routeToRun.points[routeToRun.points.length - 1].lat, lng: routeToRun.points[routeToRun.points.length - 1].lng } : null,
+    [routeToRun]
+  );
+
+  useEffect(() => {
+    if (isRouteMode && !routeModeActive) {
+      setRouteModeActive(true);
+      setOriginalTime(routeToRun?.durationSec || null);
+    }
+  }, [isRouteMode, routeToRun, routeModeActive]);
+
+  // Play the intro only once, after start & end are known
+  useEffect(() => {
+    if (isRouteMode && routeModeActive && routeStart && routeEnd && !introPlayedRef.current) {
+      introPlayedRef.current = true;
+      setShowRouteIntro(true);
+    }
+  }, [isRouteMode, routeModeActive, routeStart, routeEnd]);
 
   function inferHeadingFromPoints(ps: { lat: number; lng: number }[]): number | null {
     if (ps.length < 2) return null;
@@ -56,6 +126,78 @@ export default function RecordScreen() {
     return (brng + 360) % 360;
   }
 
+  const animateFollowCamera = useCallback((
+    position: LatLng,
+    headingDeg: number | undefined,
+    speedMps: number | undefined
+  ) => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    // if user has panned while idle, don't follow until they tap recenter
+    if (!followUserRef.current && !recordingRef.current) return;
+
+    const now = Date.now();
+    if (now - lastAnimRef.current < CAMERA_THROTTLE_MS) return;
+
+    const last = lastCamPosRef.current;
+    const moved = last ? haversineMeters(last, position) : Infinity;
+
+    // compute face (prefer GPS heading, fall back to inferred)
+    const inferred = inferHeadingFromPoints(points);
+    const face = (headingDeg && headingDeg > 0 ? headingDeg : (inferred ?? lastHeadingRef.current ?? 0)) || 0;
+
+    const turned = degDiff(lastCamHeadingRef.current, face);
+
+    // gate updates to meaningful motion/turn
+    if (moved < MOVE_THRESHOLD_M && turned < HEAD_TURN_THRESHOLD) return;
+
+    lastAnimRef.current = now;
+    lastCamPosRef.current = position;
+    lastCamHeadingRef.current = face;
+
+    const speed = Math.max(0, speedMps ?? 0);
+    const speedKmh = speed * 3.6;
+    const { zoom, pitch } = getCameraSettings(speedKmh);
+
+    const moving = speed > 0.8;
+    const center = moving
+      ? offsetByMeters(position, forwardBiasMeters(speedKmh, zoom), face)
+      : position;
+
+    map.animateCamera(
+      {
+        center,
+        heading: face,
+        pitch: moving && (recordingRef.current || followUserRef.current) ? pitch : 0,
+        zoom: recordingRef.current ? zoom : Math.min(17, zoom),
+      },
+      { duration: moving ? SMOOTH_NAV_CONFIG.CAMERA.animationDuration : 280 }
+    );
+  }, [points]);
+
+  const enableFollowAndRecenter = useCallback(async () => {
+    setFollowUser(true);
+    try {
+      // light tap to confirm click
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+      const loc = await Location.getCurrentPositionAsync({});
+      const pos = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
+      // force immediate animate (ignore throttle on recenter)
+      lastAnimRef.current = 0;
+      lastCamPosRef.current = null;
+      animateFollowCamera(pos, loc.coords.heading, loc.coords.speed);
+    } catch {}
+  }, [animateFollowCamera]);
+
+  const handleRegionChange = useCallback(() => {
+    // While recording, keep following even if the user drags (prevents accidental zoom-outs)
+    if (recordingRef.current) return;
+    if (followUserRef.current) setFollowUser(false);
+  }, []);
+
+  // Initial position + one-time focus
+  const didInitRef = useRef(false);
   useEffect(() => {
     (async () => {
       const { status: fg } = await Location.requestForegroundPermissionsAsync();
@@ -70,77 +212,85 @@ export default function RecordScreen() {
       const initialPos = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
       setCurrentPosition(initialPos);
 
-      const next: Region = {
-        latitude: loc.coords.latitude,
-        longitude: loc.coords.longitude,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      };
-      setRegion(next);
-      mapRef.current?.animateToRegion(next, 500);
-    })();
-  }, []);
+      // One-time initial camera
+      if (!didInitRef.current && mapRef.current) {
+        didInitRef.current = true;
+        const target = isRouteMode && routeStart
+          ? { latitude: routeStart.lat, longitude: routeStart.lng }
+          : initialPos;
 
+        mapRef.current.animateCamera(
+          { center: target, zoom: 16, pitch: 0, heading: 0 },
+          { duration: 500 }
+        );
+      }
+    })();
+  }, [isRouteMode, routeStart]);
+
+  // Route mode geofencing
   useEffect(() => {
-    let sub: Location.LocationSubscription | null = null;
+    if (!routeModeActive || !currentPosition || !routeStart || !routeEnd) return;
+
+    const distToStart = haversineMeters(currentPosition, { latitude: routeStart.lat, longitude: routeStart.lng });
+    const distToEnd = haversineMeters(currentPosition, { latitude: routeEnd.lat, longitude: routeEnd.lng });
+
+    setNearStart(distToStart < START_RADIUS * 2);
+    setNearEnd(distToEnd < END_RADIUS * 2);
+
+    if (!routeStarted && !recording && distToStart < START_RADIUS) {
+      setRouteStarted(true);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {}); // GO!
+      handleStart();
+      Alert.alert('🟢 GO!', 'Route recording started!');
+    }
+
+    if (routeStarted && recording && !routeEnded && distToEnd < END_RADIUS && points.length > 10) {
+      setRouteEnded(true);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {}); // Finish thump
+      handleStop();
+    }
+  }, [currentPosition, routeModeActive, routeStart, routeEnd, recording, routeStarted, routeEnded, points.length]);
+
+  // SINGLE watchPositionAsync instance
+  useEffect(() => {
     let tracker: SmoothLocationTracker | null = null;
 
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') return;
 
-      tracker = new SmoothLocationTracker((position, heading) => {
-        setCurrentPosition(position);
-
-        if (followUserRef.current && mapRef.current) {
-          const now = Date.now();
-          if (now - lastAnimRef.current < 300) return;
-          lastAnimRef.current = now;
-
-          const speedKmh = lastSpeedRef.current * 3.6;
-          const { zoom, pitch } = getCameraSettings(speedKmh);
-          let face = heading || lastHeadingRef.current || inferHeadingFromPoints(points) || 0;
-
-          const moving = lastSpeedRef.current > 0.8;
-          if (!moving) {
-            mapRef.current.animateCamera(
-              { center: position, heading: face, pitch: 0, zoom: Math.min(17, getCameraSettings(0).zoom) },
-              { duration: 300 }
-            );
-            return;
-          }
-
-          const targetCenter = offsetByMeters(position, forwardBiasMeters(speedKmh, zoom), face);
-          mapRef.current.animateCamera(
-            { center: targetCenter, heading: face, pitch: recording ? pitch : 0, zoom: recording ? zoom : 17 },
-            { duration: SMOOTH_NAV_CONFIG.CAMERA.animationDuration }
-          );
-        }
+      tracker = new SmoothLocationTracker(() => {
+        // camera driven by raw GPS below for consistency
       });
-
       smoothTracker.current = tracker;
 
-      sub = await Location.watchPositionAsync(
+      try { watchRef.current?.remove(); } catch {}
+      watchRef.current = await Location.watchPositionAsync(
         SMOOTH_NAV_CONFIG.GPS,
         (loc) => {
           lastSpeedRef.current = loc.coords.speed ?? 0;
           if (loc.coords.heading && loc.coords.heading > 0) lastHeadingRef.current = loc.coords.heading;
           tracker?.updatePosition(loc);
 
-          if (recording) {
-            add({ lat: loc.coords.latitude, lng: loc.coords.longitude, ts: Date.now() });
+          const pos = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
+          setCurrentPosition(pos);
+
+          // Follow camera while moving (throttled & gated inside)
+          animateFollowCamera(pos, loc.coords.heading, loc.coords.speed);
+
+          if (recordingRef.current) {
+            add({ lat: pos.latitude, lng: pos.longitude, ts: Date.now() });
           }
         }
       );
     })();
 
     return () => {
+      try { watchRef.current?.remove(); } catch {}
+      watchRef.current = null;
       tracker?.stop();
-      try { sub?.remove(); } catch {}
     };
-  }, [recording, add, points]);
-
-  useEffect(() => { followUserRef.current = followUser; }, [followUser]);
+  }, [add, animateFollowCamera]);
 
   const liveDistKm = useMemo(() => distanceKm(points), [points]);
   const liveDurSec = useMemo(
@@ -149,65 +299,64 @@ export default function RecordScreen() {
   );
   const liveAvg = useMemo(() => avgKmh(liveDistKm, liveDurSec), [liveDistKm, liveDurSec]);
 
-  const recenter = async () => {
-    setFollowUser(true);
-    const loc = await Location.getCurrentPositionAsync({});
-    const gpsHeading = (loc.coords.heading && loc.coords.heading > 0) ? loc.coords.heading : undefined;
-    const inferred = inferHeadingFromPoints(points) ?? 0;
-    const face = gpsHeading ?? lastHeadingRef.current ?? inferred;
-    const speedKmh = (loc.coords.speed ?? 0) * 3.6;
-    const { zoom, pitch } = getCameraSettings(speedKmh);
-
-    const center = (loc.coords.speed ?? 0) > 0.8
-      ? offsetByMeters({ latitude: loc.coords.latitude, longitude: loc.coords.longitude }, forwardBiasMeters(speedKmh, zoom), face)
-      : { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
-
-    const next: Region = { latitude: center.latitude, longitude: center.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 };
-    setRegion(next);
-
-    mapRef.current?.animateCamera(
-      { center, heading: face, pitch: (loc.coords.speed ?? 0) > 0.8 && recording ? pitch : 0, zoom: recording ? zoom : 17 },
-      { duration: 500 }
-    );
-  };
-
   const handleStart = async () => {
+    if (recording) return;
     start();
     setFollowUser(true);
 
-    const started = await Location.hasStartedLocationUpdatesAsync(TASK_NAME);
-    if (!started) {
+    try {
+      const started = await Location.hasStartedLocationUpdatesAsync(TASK_NAME);
+      if (started) { try { await Location.stopLocationUpdatesAsync(TASK_NAME); } catch {} }
       await Location.startLocationUpdatesAsync(TASK_NAME, {
         accuracy: Location.Accuracy.BestForNavigation,
         timeInterval: 2000,
         distanceInterval: 5,
         showsBackgroundLocationIndicator: true,
         pausesUpdatesAutomatically: false,
-        foregroundService: { notificationTitle: 'Tracklink Recording', notificationBody: 'Your drive is being recorded.' },
-      }).catch((e) => console.warn('startLocationUpdatesAsync failed', e));
+        foregroundService: {
+          notificationTitle: isRouteMode ? 'Tracklink Route Run' : 'Tracklink Recording',
+          notificationBody: isRouteMode ? 'Running your route...' : 'Your drive is being recorded.',
+        },
+      });
+    } catch (e) {
+      console.warn('startLocationUpdatesAsync failed', e);
     }
   };
 
   const handleStop = async () => {
-    const started = await Location.hasStartedLocationUpdatesAsync(TASK_NAME);
-    if (started) { await Location.stopLocationUpdatesAsync(TASK_NAME).catch(() => {}); }
+    const pts = [...points];
+
+    try {
+      const started = await Location.hasStartedLocationUpdatesAsync(TASK_NAME);
+      if (started) { await Location.stopLocationUpdatesAsync(TASK_NAME); }
+    } catch {}
+
     stop();
 
-    const d = distanceKm(points);
-    const s = durationSec(points);
+    const d = distanceKm(pts);
+    const s = durationSec(pts);
     const v = avgKmh(d, s);
     setSumDistanceKm(d);
     setSumDurationSec(s);
     setSumAvgKmh(v);
 
-    // Default title/desc
     const now = new Date();
-    setDriveTitle(`Drive ${now.toLocaleString()}`);
-    setDriveDesc('');
+    if (isRouteMode && routeToRun) {
+      setDriveTitle(`${routeToRun.title} - Run ${now.toLocaleDateString()}`);
+      const timeDiff = s - (originalTime || 0);
+      const faster = timeDiff < 0;
+      setDriveDesc(`Route replay • ${faster ? '🏆' : ''} ${Math.abs(timeDiff)}s ${faster ? 'faster' : 'slower'} than original`);
+    } else {
+      setDriveTitle(`Drive ${now.toLocaleString()}`);
+      setDriveDesc('');
+    }
     setShowSummary(true);
   };
 
-  const onSaveDrive = () => {
+  const onSaveDrive = async () => {
+    // subtle confirmation
+    await Haptics.selectionAsync().catch(() => {});
+
     const now = Date.now();
     const payload = {
       id: String(now),
@@ -219,32 +368,87 @@ export default function RecordScreen() {
       durationSec: sumDurationSec,
       avgKmh: sumAvgKmh,
       points: [...points],
+      originalRouteId: routeToRun?.id,
     };
     addDrive(payload);
     setShowSummary(false);
     reset();
-    Alert.alert('Saved', 'Drive saved. Check the Drives tab.');
+
+    setRouteModeActive(false);
+    setRouteStarted(false);
+    setRouteEnded(false);
+
+    if (isRouteMode) {
+      Alert.alert('Route Complete! 🎯', 'Your run has been saved. Check the Drives tab to see your time.');
+      navigation.reset({ index: 0, routes: [{ name: 'Tabs', params: { screen: 'Drives' } }] });
+    } else {
+      Alert.alert('Saved', 'Drive saved. Check the Drives tab.');
+    }
   };
 
-  const onDiscard = () => {
+  const onDiscard = async () => {
+    // subtle confirmation
+    await Haptics.selectionAsync().catch(() => {});
     setShowSummary(false);
     reset();
+
+    setRouteModeActive(false);
+    setRouteStarted(false);
+    setRouteEnded(false);
+
+    if (isRouteMode) {
+      navigation.reset({ index: 0, routes: [{ name: 'Tabs', params: { screen: 'Drives' } }] });
+    }
   };
 
-  const handleRegionChange = () => { if (followUser) setFollowUser(false); };
+  const handleExitRoute = async () => {
+    setRouteModeActive(false);
+
+    if (recording) {
+      try {
+        const started = await Location.hasStartedLocationUpdatesAsync(TASK_NAME);
+        if (started) { await Location.stopLocationUpdatesAsync(TASK_NAME).catch(() => {}); }
+      } catch {}
+      stop();
+    }
+
+    setRouteStarted(false);
+    setRouteEnded(false);
+    setNearStart(false);
+    setNearEnd(false);
+    reset();
+
+    navigation.reset({ index: 0, routes: [{ name: 'Tabs', params: { screen: 'Drives' } }] });
+  };
 
   return (
     <View style={{ flex: 1 }}>
       <MapView
         ref={mapRef}
         style={{ flex: 1 }}
-        initialRegion={region}
+        // Use only an initial region; camera is controlled by animateCamera.
+        initialRegion={{
+          latitude: 43.653,
+          longitude: -79.383,
+          latitudeDelta: 0.05,
+          longitudeDelta: 0.05,
+        }}
         showsUserLocation
         followsUserLocation={false}
         customMapStyle={darkMapStyle as any}
-        onPanDrag={handleRegionChange}
-        onRegionChangeComplete={handleRegionChange}
+        onPanDrag={!recording ? handleRegionChange : undefined}
+        onRegionChangeComplete={!recording ? handleRegionChange : undefined}
       >
+        {isRouteMode && routeToRun && (
+          <Polyline
+            coordinates={routeToRun.points.map((p) => ({ latitude: p.lat, longitude: p.lng }))}
+            strokeWidth={3}
+            strokeColor="#6b7280"
+            strokeColors={['#6b7280']}
+            lineDashPattern={[10, 10]}
+          />
+        )}
+
         {points.length > 1 && (
           <Polyline
             coordinates={points.map((p) => ({ latitude: p.lat, longitude: p.lng }))}
@@ -253,14 +457,54 @@ export default function RecordScreen() {
           />
         )}
 
-        {points.length > 0 && (
+        {isRouteMode && routeStart && (
+          <>
+            <Circle
+              center={{ latitude: routeStart.lat, longitude: routeStart.lng }}
+              radius={START_RADIUS}
+              fillColor={nearStart ? 'rgba(34, 197, 94, 0.4)' : 'rgba(34, 197, 94, 0.2)'}
+              strokeColor={nearStart ? '#22c55e' : '#10b981'}
+              strokeWidth={nearStart ? 3 : 2}
+              zIndex={10}
+            />
+            <Marker
+              coordinate={{ latitude: routeStart.lat, longitude: routeStart.lng }}
+              title="START"
+              description="Enter zone to begin"
+              pinColor="#10b981"
+              zIndex={11}
+            />
+          </>
+        )}
+
+        {isRouteMode && routeEnd && (
+          <>
+            <Circle
+              center={{ latitude: routeEnd.lat, longitude: routeEnd.lng }}
+              radius={END_RADIUS}
+              fillColor={nearEnd ? 'rgba(239, 68, 68, 0.4)' : 'rgba(239, 68, 68, 0.2)'}
+              strokeColor={nearEnd ? '#ef4444' : '#dc2626'}
+              strokeWidth={nearEnd ? 3 : 2}
+              zIndex={10}
+            />
+            <Marker
+              coordinate={{ latitude: routeEnd.lat, longitude: routeEnd.lng }}
+              title="FINISH"
+              description="Enter zone to stop"
+              pinColor="#ef4444"
+              zIndex={11}
+            />
+          </>
+        )}
+
+        {!isRouteMode && points.length > 0 && (
           <Marker
             coordinate={{ latitude: points[0].lat, longitude: points[0].lng }}
             title="Start"
             pinColor="#10b981"
           />
         )}
-        {!recording && points.length > 1 && (
+        {!isRouteMode && !recording && points.length > 1 && (
           <Marker
             coordinate={{ latitude: points[points.length - 1].lat, longitude: points[points.length - 1].lng }}
             title="End"
@@ -269,13 +513,35 @@ export default function RecordScreen() {
         )}
       </MapView>
 
-      {/* Stats overlay */}
+      {/* Stats */}
       <View style={{
         position: 'absolute', top: 40, alignSelf: 'center', backgroundColor: '#0B1020',
-        padding: 12, borderRadius: 12, borderWidth: 1, borderColor: '#1f2937', minWidth: 200, alignItems: 'center'
+        padding: 12, borderRadius: 12, borderWidth: 1, borderColor: '#1f2937', minWidth: 240, alignItems: 'center',
+        shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 3.84, elevation: 5
       }}>
+        {isRouteMode && !routeStarted && (
+          <>
+            <Text style={{ color: '#fbbf24', fontSize: 16, fontWeight: '800', marginBottom: 4 }}>
+              🏁 Route Challenge
+            </Text>
+            <Text style={{ color: '#e5e7eb', fontSize: 12, marginBottom: 8 }}>
+              Drive to START zone ({START_RADIUS}m)
+            </Text>
+          </>
+        )}
+        {isRouteMode && routeStarted && !routeEnded && (
+          <Text style={{ color: '#22c55e', fontSize: 16, fontWeight: '800', marginBottom: 4 }}>
+            🚗 Racing!
+          </Text>
+        )}
+        {isRouteMode && routeEnded && (
+          <Text style={{ color: '#fbbf24', fontSize: 16, fontWeight: '800', marginBottom: 4 }}>
+            🏆 Finished!
+          </Text>
+        )}
+
         <Text style={{ color: 'white', fontSize: 18, fontWeight: '700' }}>
-          {recording ? '🔴 Recording' : 'Ready'}
+          {recording ? '🔴 Recording' : isRouteMode ? 'Route Mode' : 'Ready'}
         </Text>
         <Text style={{ color: '#9CA3AF', marginTop: 4 }}>Distance: {liveDistKm.toFixed(2)} km</Text>
         <Text style={{ color: '#9CA3AF' }}>Time: {Math.floor(liveDurSec / 60)}m {liveDurSec % 60}s</Text>
@@ -285,11 +551,41 @@ export default function RecordScreen() {
             Current: {(lastSpeedRef.current * 3.6).toFixed(1)} km/h
           </Text>
         )}
+        {isRouteMode && originalTime && recording && (
+          <View style={{ marginTop: 8, paddingTop: 8, borderTopWidth: 1, borderColor: '#374151', width: '100%' }}>
+            <Text style={{ color: '#9CA3AF', textAlign: 'center' }}>
+              Target: {Math.floor(originalTime / 60)}m {originalTime % 60}s
+            </Text>
+            {liveDurSec > 0 && (
+              <Text style={{
+                color: liveDurSec < originalTime ? '#22c55e' : '#ef4444',
+                fontWeight: '700',
+                textAlign: 'center'
+              }}>
+                {liveDurSec < originalTime ? '🏆 ' : ''}
+                {Math.abs(liveDurSec - originalTime)}s {liveDurSec < originalTime ? 'ahead' : 'behind'}
+              </Text>
+            )}
+          </View>
+        )}
       </View>
 
-      {/* Recenter */}
+      {/* Exit Route */}
+      {isRouteMode && !recording && (
+        <Pressable
+          onPress={handleExitRoute}
+          style={{
+            position: 'absolute', left: 16, bottom: 100, backgroundColor: '#374151',
+            paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1, borderColor: '#111827',
+          }}
+        >
+          <Text style={{ color: 'white', fontWeight: '700' }}>Exit Route</Text>
+        </Pressable>
+      )}
+
+      {/* Recenter / Follow */}
       <Pressable
-        onPress={recenter}
+        onPress={enableFollowAndRecenter}
         style={{
           position: 'absolute', right: 16, bottom: 100, backgroundColor: followUser ? '#4f46e5' : '#1f2937',
           paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1, borderColor: '#111827',
@@ -301,29 +597,53 @@ export default function RecordScreen() {
       </Pressable>
 
       {/* Start/Stop */}
-      <View style={{ position: 'absolute', bottom: 24, alignSelf: 'center' }}>
-        {recording ? (
-          <Pressable
-            onPress={handleStop}
-            style={{ backgroundColor: '#ef4444', paddingVertical: 14, paddingHorizontal: 32, borderRadius: 12, borderWidth: 1, borderColor: '#111827' }}
-          >
-            <Text style={{ color: 'white', fontWeight: '800', fontSize: 16 }}>Stop Recording</Text>
-          </Pressable>
-        ) : (
-          <Pressable
-            onPress={handleStart}
-            style={{ backgroundColor: '#10b981', paddingVertical: 14, paddingHorizontal: 32, borderRadius: 12, borderWidth: 1, borderColor: '#111827' }}
-          >
-            <Text style={{ color: 'white', fontWeight: '800', fontSize: 16 }}>Start Recording</Text>
-          </Pressable>
-        )}
-      </View>
+      {(!isRouteMode || (isRouteMode && nearStart)) && (
+        <View style={{ position: 'absolute', bottom: 24, alignSelf: 'center' }}>
+          {recording ? (
+            <Pressable
+              onPress={handleStop}
+              disabled={isRouteMode && !nearEnd}
+              style={{
+                backgroundColor: isRouteMode && !nearEnd ? '#374151' : '#ef4444',
+                paddingVertical: 14,
+                paddingHorizontal: 32,
+                borderRadius: 12,
+                borderWidth: 1,
+                borderColor: '#111827'
+              }}
+            >
+              <Text style={{ color: 'white', fontWeight: '800', fontSize: 16 }}>
+                {isRouteMode && !nearEnd ? 'Drive to FINISH' : 'Stop Recording'}
+              </Text>
+            </Pressable>
+          ) : (
+            !isRouteMode && (
+              <Pressable
+                onPress={handleStart}
+                style={{ backgroundColor: '#10b981', paddingVertical: 14, paddingHorizontal: 32, borderRadius: 12, borderWidth: 1, borderColor: '#111827' }}
+              >
+                <Text style={{ color: 'white', fontWeight: '800', fontSize: 16 }}>Start Recording</Text>
+              </Pressable>
+            )
+          )}
+        </View>
+      )}
 
-      {/* Summary + Title/Description */}
+      {/* Cinematic Route Intro */}
+      <RouteIntroOverlay
+        visible={showRouteIntro}
+        startLabel="START"
+        endLabel="END"
+        onDone={() => setShowRouteIntro(false)}
+      />
+
+      {/* Summary */}
       <Modal visible={showSummary} animationType="slide" transparent>
         <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', padding: 16 }}>
           <View style={{ backgroundColor: '#0B1020', borderRadius: 12, padding: 16, borderWidth: 1, borderColor: '#1f2937' }}>
-            <Text style={{ color: 'white', fontSize: 20, fontWeight: '700', marginBottom: 12 }}>Drive Summary</Text>
+            <Text style={{ color: 'white', fontSize: 20, fontWeight: '700', marginBottom: 12 }}>
+              {isRouteMode ? 'Route Complete! 🎯' : 'Drive Summary'}
+            </Text>
 
             <TextInput
               value={driveTitle}
@@ -345,12 +665,28 @@ export default function RecordScreen() {
             <Text style={{ color: '#e5e7eb', marginBottom: 4 }}>Time: {Math.floor(sumDurationSec / 60)}m {sumDurationSec % 60}s</Text>
             <Text style={{ color: '#e5e7eb', marginBottom: 12 }}>Avg Speed: {sumAvgKmh.toFixed(1)} km/h</Text>
 
+            {isRouteMode && originalTime && (
+              <View style={{
+                padding: 12,
+                backgroundColor: sumDurationSec < originalTime ? '#065f46' : '#7f1d1d',
+                borderRadius: 8,
+                marginBottom: 12
+              }}>
+                <Text style={{ color: 'white', fontWeight: '700', textAlign: 'center' }}>
+                  {sumDurationSec < originalTime ? '🏆 NEW PERSONAL BEST!' : 'Keep practicing!'}
+                </Text>
+                <Text style={{ color: '#e5e7eb', textAlign: 'center', marginTop: 4 }}>
+                  {Math.abs(sumDurationSec - originalTime)}s {sumDurationSec < originalTime ? 'faster' : 'slower'} than original
+                </Text>
+              </View>
+            )}
+
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 16, gap: 12 }}>
               <Pressable onPress={onDiscard} style={{ flex: 1, padding: 12, backgroundColor: '#374151', borderRadius: 8, alignItems: 'center' }}>
                 <Text style={{ color: 'white', fontWeight: '600' }}>Discard</Text>
               </Pressable>
               <Pressable onPress={onSaveDrive} style={{ flex: 1, padding: 12, backgroundColor: '#4f46e5', borderRadius: 8, alignItems: 'center' }}>
-                <Text style={{ color: 'white', fontWeight: '700' }}>Save Drive</Text>
+                <Text style={{ color: 'white', fontWeight: '700' }}>Save {isRouteMode ? 'Run' : 'Drive'}</Text>
               </Pressable>
             </View>
           </View>

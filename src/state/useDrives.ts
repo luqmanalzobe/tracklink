@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export type SavedDrive = {
@@ -11,42 +12,71 @@ export type SavedDrive = {
   durationSec: number;
   avgKmh: number;
   points: { lat: number; lng: number; ts: number }[];
+  originalRouteId?: string;
 };
 
 type DrivesState = {
   drives: SavedDrive[];
   addDrive: (d: SavedDrive) => void;
-  removeDrive: (id: string) => void;          // NEW
+  updateDrive: (id: string, patch: Partial<SavedDrive>) => void;
+  removeDrive: (id: string) => void;
   clearAll: () => void;
-  _hydrate: () => Promise<void>;
+  _hydrate: () => Promise<void>; // no-op (kept for compat)
 };
 
-const STORAGE_KEY = 'tracklink.drives.v1';
+const STORAGE_KEY = 'tracklink.drives.v2';
 
-export const useDrives = create<DrivesState>((set, get) => ({
-  drives: [],
-  addDrive: (d) => {
-    const next = [d, ...get().drives];
-    set({ drives: next });
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-  },
-  removeDrive: (id) => {                       // NEW
-    const next = get().drives.filter((x) => x.id !== id);
-    set({ drives: next });
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => {});
-  },
-  clearAll: () => {
-    set({ drives: [] });
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify([])).catch(() => {});
-  },
-  _hydrate: async () => {
-    try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as SavedDrive[];
-        const normalized = parsed.map((d) => ({ description: '', ...d }));
-        set({ drives: normalized });
-      }
-    } catch {}
-  },
-}));
+const sortDrives = (arr: SavedDrive[]) =>
+  [...arr].sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0));
+
+export const useDrives = create<DrivesState>()(
+  persist(
+    (set, get) => ({
+      drives: [],
+
+      addDrive: (d) => {
+        const existing = get().drives.filter(x => x.id !== d.id);
+        const next = sortDrives([d, ...existing]);
+        set({ drives: next });
+      },
+
+      updateDrive: (id, patch) => {
+        const next = sortDrives(
+          get().drives.map(d => (d.id === id ? { ...d, ...patch } : d))
+        );
+        set({ drives: next });
+      },
+
+      removeDrive: (id) => {
+        const next = get().drives.filter(x => x.id !== id);
+        set({ drives: next });
+      },
+
+      clearAll: () => set({ drives: [] }),
+
+      _hydrate: async () => Promise.resolve(),
+    }),
+    {
+      name: STORAGE_KEY,
+      version: 2,
+      storage: createJSONStorage(() => AsyncStorage),
+      migrate: async (persisted, fromVersion) => {
+        if (!persisted) return { drives: [] } as DrivesState;
+        if (fromVersion < 2) {
+          const drives = Array.isArray((persisted as any).drives)
+            ? (persisted as any).drives.map((d: SavedDrive) => ({
+                description: '',
+                ...d,
+              }))
+            : [];
+          return { ...(persisted as any), drives: sortDrives(drives) };
+        }
+        const drives = Array.isArray((persisted as any).drives)
+          ? sortDrives((persisted as any).drives)
+          : [];
+        return { ...(persisted as any), drives };
+      },
+      partialize: (s) => ({ drives: s.drives }),
+    }
+  )
+);
